@@ -1,0 +1,155 @@
+#!/bin/bash
+# scp ext2btrfs root@12.345.678.912: && ssh root@12.345.678.912 bash ext2btrfs
+
+set -e
+
+#apt-get update
+apt-get install -y btrfs-tools
+apt-get install -y busybox-static
+
+mount -t tmpfs ramdisk /mnt
+
+mkdir /mnt/{proc,sys,dev}
+
+mkdir -p /mnt/{bin,sbin,usr/bin,usr/sbin}
+
+#cp /bin/bash /mnt/bin
+#for f in $(ldd /bin/bash | perl -ne '/(\S+) \(0x[a-z0-9]+\)/ and print "$1\n"'); do [[ ! -f $f ]] && continue; mkdir -p /mnt/${f%/*} && cp -v $f /mnt/$f; done
+#ln -s bash /mnt/bin/sh
+
+cp /bin/busybox /mnt/bin
+/mnt/bin/busybox --install /mnt/bin
+
+cp /sbin/btrfs-convert /mnt/sbin
+for f in $(ldd /sbin/btrfs-convert | perl -ne '/(\S+) \(0x[a-z0-9]+\)/ and print "$1\n"'); do [[ ! -f $f ]] && continue; mkdir -p /mnt/${f%/*} && cp -v $f /mnt/$f; done
+
+cp /sbin/btrfs /mnt/sbin
+for f in $(ldd /sbin/btrfs | perl -ne '/(\S+) \(0x[a-z0-9]+\)/ and print "$1\n"'); do [[ ! -f $f ]] && continue; mkdir -p /mnt/${f%/*} && cp -v $f /mnt/$f; done
+
+#cat > /mnt/init <<'EOF'
+##!/bin/bash
+#
+#run_from_file() {
+#  local f t
+#  for f in /dev/fd/*; do
+#    [ -h $f ] || continue
+#    [ $f -ef "$0" ] && return
+#  done
+#  t=$(mktemp)
+#  cat > $t
+#  if [ "$(head -n 1 $t)" = '#!/bin/bash' ]; then
+#    chmod +x $t
+#    exec /bin/bash $t "$@" </dev/fd/2
+#  else
+#    rm -f $t
+#    echo "Direct execution not supported with this shell ($_)." >&2
+#    echo "Please try bash instead." >&2
+#    exit 1
+#  fi
+#}
+#
+## do not modify the two lines below
+#[ -h /dev/fd/0 ] && run_from_file
+##!/bin/bash
+#echo "=== starting init ==="
+#set -x
+#/bin/bash -l -i
+#set +x
+#echo "=== end of init. rebooting in 5s ==="
+#sleep 5
+#reboot -f
+#EOF
+
+#cat > /mnt/init <<'EOF'
+##!/bin/bash
+#echo "=== starting init ==="
+#set -x
+#/bin/bash -l -i
+#set +x
+#echo "=== end of init. rebooting in 5s ==="
+#sleep 5
+#reboot -f
+#EOF
+
+cat > /mnt/init <<'EOF'
+#!/bin/sh
+
+set -e
+
+on_exit() {
+   rc="$?"
+   if [ "$rc" -eq 0 ]; then
+     echo "=== init done: rebooting in 5s ==="
+     for i in $(seq 1 5); do
+        sleep 1
+        echo -n '.'
+     done
+     echo
+     sync
+     reboot -f
+   else
+     echo "=== init failed: opening shell ==="
+     sync
+     /bin/sh
+   fi
+}
+
+trap on_exit EXIT
+
+clear
+echo "=== starting init ==="
+
+echo "=== unmounting old root ==="
+umount -l /dev/vda1
+sleep 5
+mount /dev/vda1 /mnt
+umount /dev/vda1
+
+echo "=== converting to btrfs ==="
+/sbin/btrfs-convert -L /dev/vda1
+
+echo "=== mounting btrfs root ==="
+mount /dev/vda1 /mnt
+
+echo "=== removing ext4 snapshot ==="
+btrfs subvolume delete /mnt/ext2_saved
+
+echo "=== defragging ==="
+btrfs filesystem defrag -r /mnt
+
+echo "=== rebalancing ==="
+btrfs balance start /mnt
+
+echo "=== updating fstab ==="
+sed -i -e 's/\(LABEL=DOROOT.*\)ext4/\1btrfs/' /mnt/etc/fstab
+sed -i -e 's/errors=remount-ro/defaults/' /mnt/etc/fstab
+
+echo "=== reinstalling grub ==="
+mount -t proc proc /mnt/proc
+mount -t sysfs sys /mnt/sys
+mount -o bind /dev /mnt/dev
+chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg
+chroot /mnt grub-install /dev/vda
+
+echo "=== rebuilding initramfs ==="
+for pkg in $(chroot /mnt /usr/bin/dpkg -l 'linux-image-*-*' | grep ^ii | awk '{print $2}'); do
+    chroot /mnt /usr/sbin/dpkg-reconfigure $pkg
+done
+
+echo "=== unmounting root ==="
+umount /mnt/dev
+umount /mnt/sys
+umount /mnt/proc
+umount /mnt
+sync
+
+EOF
+
+chmod 0755 /mnt/init
+
+losetup -D || true
+modprobe btrfs
+
+sleep 1
+trap - EXIT
+systemctl switch-root /mnt /init
